@@ -2,11 +2,12 @@
 # This .gitignore file was automatically created by Microsoft(R) Visual Studio.
 ################################################################################
 
-/Drone Patrol/.vs/Drone Patrol/v16
-/Drone Patrol/MDK
-/Drone Patrol/bin
-/Drone Patrol/obj
-/Drone Patrol/Drone Patrol.csproj
-/Drone Patrol/Drone Patrol.sln
+
 /.vs
 /Drone Patrol/Drone Patrol.csproj.user
+/MDK
+/obj
+/bin
+*.csproj
+*.user
+*.sln
