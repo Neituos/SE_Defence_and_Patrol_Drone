@@ -26,15 +26,15 @@ namespace IngameScript
 		const string strControllerTagConfig = "controller_tag";
 		const string strHomeTag = "home_gps";
 		string strBlockTag = "[DronePatrol]";
-		string strBlockControllerTag = "[DPController]"; //This tag must exist on the remote control that will maintain all patrol coordinates in addition to the BlockTag
+		string strBlockControllerTag = "[DPController]";
+		bool _patrolEnabled = true;
 
 		//Configuration Section 
 		const double maxFollowRange = 5000; //Distance from home or last location before returning 
 		const double maxEnemyRange = 2500; //Max range enemy gets from the drone before returning 
 		const float turretRange = 600; //Turret Range 
 		const float distanceBuffer = 5; //Used for home and last location. Distace from waypoint before it toggles done (meters)
-		const double followDistance = 200;  //Distance drone will keep from target
-		const double attackDistance = 200;  //Distance drone will keep from target
+		const double trackingDistance = 200;  //Distance drone will keep from target
 		const bool autoHome = true; //If true, will auto home if not near home when in Idle mode
 
 		//Do not edit below this point.
@@ -55,30 +55,32 @@ namespace IngameScript
 
 		Vector3D lastLoc = new Vector3D(Vector3D.Zero);
 		Vector3D _homeLoc = new Vector3D(Vector3D.Zero);
-		Vector3D emptyLoc = new Vector3D(Vector3D.Zero);
+
 		List<MyWaypointInfo> _patrolRoute = null;
 
-		bool PatrolEnabled { get { return _remoteBlock != null && _remoteBlock.FlightMode == FlightMode.Patrol; } }
+		enum OperationMode
+		{
+			Stationary,
+			SingleCtrl,
+			RemoteCtrl
+		}
+		OperationMode _opMode { get; set; }
 
 		List<IMyUserControllableGun> _activeTurrets = null;
 
-		public string SanitizeCustom(string key, string data)
-        {
-			return data.Replace(key, "").Replace("=", "").Trim();
-		}
+		public string SanitizeCustom(string key, string data) {	return data.Replace(key, "").Replace("=", "").Trim(); }
+
+		Dictionary<string, Action> _commands = new Dictionary<string, Action>(StringComparer.OrdinalIgnoreCase);
+		MyCommandLine _commandLine = new MyCommandLine();
+
 
 		public Program()
         {
-			// The constructor, called only once every session and
-			// always before any other method is called. Use it to
-			// initialize your script. 
-			//     
-			// The constructor is optional and can be removed if not
-			// needed.
-			// 
-			// It's recommended to set Runtime.UpdateFrequency 
-			// here, which will allow your script to run itself without a 
-			// timer block.
+			_commands["home"] = UpdateHome;
+			_commands["reset"] = Reset;
+			_commands["route"] = SetRoute;
+			_commands["patrol"] = TogglePatrol;
+			_commands["init"] = Initialize;
 
 			var customData = Me.CustomData;
 			if(!String.IsNullOrEmpty(customData))
@@ -101,7 +103,8 @@ namespace IngameScript
 					}
 				}
 			}
-            
+			_opMode = OperationMode.Stationary;
+
 			Runtime.UpdateFrequency = UpdateFrequency.Once | UpdateFrequency.Update100;
         }
 
@@ -130,53 +133,86 @@ namespace IngameScript
 
 		public int ScanForBlocks(bool rescan=false)
         {
-			if(!rescan || AllBlocksFound()) return 0;
-			EchoToLCD("Scanning for available blocks...");
+			if (!AllBlocksFound() || rescan)
+			{
+				EchoToLCD("Scanning for available blocks...");
 
-			List<IMyTerminalBlock> searchResults = new List<IMyTerminalBlock>();
-			GridTerminalSystem.SearchBlocksOfName(strBlockTag, searchResults, x => Me.CubeGrid == x.CubeGrid);
+				List<IMyTerminalBlock> searchResults = new List<IMyTerminalBlock>();
+				GridTerminalSystem.SearchBlocksOfName(strBlockTag, searchResults, x => Me.CubeGrid == x.CubeGrid);
 
-            foreach (var block in searchResults)
-            {
-				if (block is IMySensorBlock) _sensorBlock = (IMySensorBlock)block;
-				else if (block is IMyTextPanel) _lcdBlock = (IMyTextPanel)block;
-				else if (block is IMyShipConnector) _connectorBlock = (IMyShipConnector)block;
-				else if (block is IMyRemoteControl)
+				foreach (var block in searchResults)
 				{
-					if (block.CustomName.Contains(strBlockControllerTag))
+					if (block is IMySensorBlock) _sensorBlock = (IMySensorBlock)block;
+					else if (block is IMyTextPanel) _lcdBlock = (IMyTextPanel)block;
+					else if (block is IMyShipConnector) _connectorBlock = (IMyShipConnector)block;
+					else if (block is IMyRemoteControl)
 					{
-						_controllerBlock = (IMyRemoteControl)block;
+						if (block.CustomName.Contains(strBlockControllerTag))
+						{
+							_controllerBlock = (IMyRemoteControl)block;
+						}
+						else
+							_remoteBlock = (IMyRemoteControl)block;
 					}
-					else
-						_remoteBlock = (IMyRemoteControl)block;
+
+					if (AllBlocksFound()) break;
 				}
 
-				if (AllBlocksFound()) return 0;
-            }
+				if (AllBlocksFound())
+                {
+					if (_activeTurrets == null)
+					{
+						_activeTurrets = new List<IMyUserControllableGun>();
+						GridTerminalSystem.GetBlocksOfType<IMyUserControllableGun>(_activeTurrets, x => Me.CubeGrid == x.CubeGrid);
+					}
 
-			//TODO: Determine a better way to scan for viable turrets.
-			if (_activeTurrets == null)
-			{
+					//Make sure the remote block assumes patrol by default
+					if (rescan) _remoteBlock.FlightMode = FlightMode.Patrol;
+					return 0;
+				}
 
-				_activeTurrets = new List<IMyUserControllableGun>();
-				GridTerminalSystem.GetBlocksOfType<IMyUserControllableGun>(_activeTurrets, x => Me.CubeGrid == x.CubeGrid);
+				if (_sensorBlock == null) EchoMissing("sensor");
+				if (_connectorBlock == null) EchoMissing("connector");
+				if (_remoteBlock == null) EchoMissing("remote controller");
+
+				return -2;
 			}
-
-			if (_sensorBlock == null) EchoMissing("sensor");
-			if (_connectorBlock == null) EchoMissing("connector");
-			if (_remoteBlock == null) EchoMissing("remote controller");
-
-			return -2;
+			return 0;
 		}
 
-		public void EchoMissing(string blocktype)
-        {
-			EchoToLCD(String.Format("No {0} block found with defined '{1}' tag.", blocktype, strBlockTag));
-        }
+		public void EchoMissing(string blocktype) {	EchoToLCD($"No {blocktype} block found with defined '{strBlockTag}' tag."); }
 
-		public void SetHome(string coords)
+		public void SaveHomeCoordinates(string coords) { if (_connectorBlock != null) _connectorBlock.CustomData = coords;	}
+
+		public void Reset()
         {
-			if (_controllerBlock != null) _controllerBlock.CustomData = coords;
+			EchoToLCD("Resetting configuration information.");
+			_patrolRoute = null;
+			_homeLoc = new Vector3D(Vector3D.Zero);
+			Initialize(echo:false);
+		}
+
+		public void UpdateHome() { SaveHomeCoordinates(Me.GetPosition().ToString()); }
+
+		public void SetRoute() { CloneWaypoints(); }
+
+		public void Initialize() { Initialize(true); }
+		public void Initialize(bool echo)
+        {
+			if(echo) EchoToLCD("Initializing Drone Patrol information.");
+			_homeLoc = Me.GetPosition();
+			ScanForBlocks(true);
+			if (_patrolRoute == null)
+			{
+				CloneWaypoints();
+			}
+		}
+
+		public void TogglePatrol()
+        {
+			bool enable = _commandLine.Argument(1).ToLower() == "enable";
+			_patrolEnabled = enable;
+			if (_remoteBlock != null && !_patrolEnabled) _remoteBlock.FlightMode = FlightMode.OneWay;
 		}
 
         public void Main(string argument, UpdateType updateSource)
@@ -188,24 +224,18 @@ namespace IngameScript
 			int errorStatus = 0;
 
 			//Checks for arguments passed into the block.  
-			if (argument == "reset")
-			{
-				EchoToLCD("Resetting configuration information.");
-				_homeLoc = Me.GetPosition();
-				ScanForBlocks(true);
-				return;
-			}
-			else if (argument == "set_home")
+			if (_commandLine.TryParse(argument))
             {
-				_homeLoc = Me.GetPosition();
-				SetHome(_homeLoc.ToString());
-				return;
-			}
-			else if (argument == "route")
-            {
-				CloneWaypoints();
-				return;
-			}
+				string command = _commandLine.Argument(0);
+				if (command != null)
+                {
+					Action commandAction;
+					if (_commands.TryGetValue(command, out commandAction))
+						commandAction();
+					else
+						EchoToLCD($"Unknown command {command}");
+                }
+            }
 
 			if(!AllBlocksFound())
             {
@@ -213,14 +243,14 @@ namespace IngameScript
 				if (!AllBlocksFound()) return;
 			}
 
-			EchoToLCD("Running...", append:false);
+			EchoToLCD($"Running in {_opMode} mode.", append:false);
 			//Sets mod indicator light
 			// modeIndicator = (IMyInteriorLight)GridTerminalSystem.GetBlockWithName(strModeIndicator);
 
 			//Checks for the Sensor 
 			if (!_sensorBlock.IsFunctional)
 			{ 
-				EchoToLCD("Sensor is damaged");
+				EchoToLCD("Sensor is not functioning");
 				errorStatus = 1; //Set Damaged State
 			}
 
@@ -251,10 +281,11 @@ namespace IngameScript
 				bool tooFar = false;
 				if (Vector3D.DistanceSquared(Me.GetPosition(), _homeLoc) > maxFollowRange * maxFollowRange)
 				{
-					if (!Equals(lastLoc, emptyLoc))
+					EchoToLCD("Max range exceeded, returning to default");
+					if (!lastLoc.IsZero())
 						ReturnLastLoc();
 					else
-						ReturnHome();
+						Patrol();
 
 					tooFar = true;
 				}
@@ -268,7 +299,7 @@ namespace IngameScript
 				else //No Targets
 				{
 					//If Patrole system Enabled
-					if (PatrolEnabled)
+					if (_patrolEnabled)
 					{
 						if (!ReturnLastLoc()) //If no longer going to last location
 							Patrol(); //Run patrole
@@ -289,14 +320,27 @@ namespace IngameScript
 
 		void CloneWaypoints()
         {
-			if(PatrolEnabled)
-            {
-				if(_patrolRoute == null) _controllerBlock.GetWaypointInfo(_patrolRoute);
+			if (_patrolEnabled)
+			{
+				if (_patrolRoute == null)
+				{
+					_patrolRoute = new List<MyWaypointInfo>();
+					if (_controllerBlock == null)
+						_remoteBlock.GetWaypointInfo(_patrolRoute);
+					else
+						_controllerBlock.GetWaypointInfo(_patrolRoute);
+				}
 
-				_remoteBlock.ClearWaypoints();
+				if (_controllerBlock != null)
+				{
+					_remoteBlock.ClearWaypoints();
+					foreach (var item in _patrolRoute) _remoteBlock.AddWaypoint(item);
+				}
 
-                foreach (var item in _patrolRoute) _remoteBlock.AddWaypoint(item);
+				if (_controllerBlock != null) _opMode = OperationMode.RemoteCtrl;
+				else _opMode = OperationMode.SingleCtrl;
 			}
+			else _opMode = OperationMode.Stationary;
         }
 
 		//Idle Drone function
@@ -314,31 +358,45 @@ namespace IngameScript
 					modeIndicator.SetValue<Color>("Color", new Color(1f, 1f, 0f));
 
 				EchoToLCD("Status: Idle");
-
-				StopPatrol();
-				ResetTargets(); //resets any target info
-
-				if (_remoteBlock != null)
+				if (_patrolEnabled && !MissingOrDamaged()) Patrol();
+				else
 				{
-					_remoteBlock.SetAutoPilotEnabled(false);
-					_remoteBlock.FlightMode = FlightMode.OneWay;
-					_remoteBlock.ClearWaypoints();
+					StopPatrol();
+					ResetTargets(); //resets any target info
+
+					if (_remoteBlock != null)
+					{
+						_remoteBlock.SetAutoPilotEnabled(false);
+						_remoteBlock.FlightMode = FlightMode.OneWay;
+						_remoteBlock.ClearWaypoints();
+					}
 				}
 			}
 		}
 
-		//If part is missing or damaged
-		void MissingOrDamaged()
+		void ToggleConnector(bool connect=true)
 		{
-			if (_remoteBlock.IsFunctional && _sensorBlock.IsFunctional) return;
+			if(_connectorBlock != null)
+            {
+				if (connect) _connectorBlock.Connect();
+				else _connectorBlock.Disconnect();
+            }
+		}
+
+		//If part is missing or damaged
+		bool MissingOrDamaged()
+		{
+			if (_remoteBlock.IsFunctional && _sensorBlock.IsFunctional) return false;
 			EchoToLCD("--[[Damaged State]]--");
 			ReturnHome();
+			return true;
 		}
 
 		//Sets the drone to use the patrol RC block
 		void Patrol()
 		{
-			if (PatrolEnabled && _remoteBlock != null)
+			ToggleConnector(false);
+			if (_patrolEnabled && _remoteBlock != null)
 			{
 				if (modeIndicator != null)
 					modeIndicator.SetValue<Color>("Color", new Color(0f, 0.5f, 1f));
@@ -346,9 +404,6 @@ namespace IngameScript
 				ResetTargets(); //resets any target info
 
 				EchoToLCD("Status: Patrol");
-
-				if (_remoteBlock != null && _remoteBlock.FlightMode != FlightMode.Patrol)
-					CloneWaypoints(); //Clears and clones waypoints on RC Block
 
 				_remoteBlock.SetAutoPilotEnabled(true);
 				_remoteBlock.FlightMode = FlightMode.Patrol;
@@ -359,26 +414,29 @@ namespace IngameScript
 		//If Patrol RC then it will disable autopilot when called 
 		void StopPatrol()
 		{
-			if (PatrolEnabled)
+			if (_patrolEnabled)
 			{
 				if (_remoteBlock != null) _remoteBlock.FlightMode = FlightMode.OneWay;
 
-				if (Equals(lastLoc, emptyLoc)) lastLoc = Me.GetPosition();
+				if (lastLoc.IsZero()) lastLoc = Me.GetPosition();
 			}
 		}
 
 		//returns drone to its home location
 		private bool ReturnHome()
 		{
-			//if the drone is within the buffer distance from the home location
+			//if the drone is within the buffer distance from the home location, try locking the connector
 			if (Vector3.DistanceSquared(_homeLoc, Me.GetPosition()) < distanceBuffer * distanceBuffer)
+			{
+				ToggleConnector();
 				return false;
+			}
 
 			//indicator light
 			if (modeIndicator != null)
 				modeIndicator.SetValue<Color>("Color", new Color(0f, 1f, 0f));
 
-			EchoToLCD("Status: " + "Returning Home");
+			EchoToLCD("Status: Returning Home");
 			EchoToLCD("Distance Home: " + Vector3.Distance(_homeLoc, Me.GetPosition()).ToString());
 
 			ResetTargets(); //resets any target info
@@ -393,20 +451,20 @@ namespace IngameScript
 		private bool ReturnLastLoc()
 		{
 			//Checks to make sure the lastLoc was not cleared.
-			if (Equals(lastLoc, emptyLoc))
+			if (lastLoc.IsZero())
 				return false;
 
 			//if the drone is within the buffer distance from its last location
 			if (Vector3.DistanceSquared(lastLoc, Me.GetPosition()) < distanceBuffer * distanceBuffer)
 			{
-				lastLoc = new Vector3D(0, 0, 0);
+				lastLoc = new Vector3D(Vector3D.Zero);
 				return false;
 			}
 
 			if (modeIndicator != null)
 				modeIndicator.SetValue<Color>("Color", new Color(0.5f, 1f, 0.5f));
 
-			EchoToLCD("CK" + Equals(lastLoc, emptyLoc).ToString());
+			EchoToLCD("CK" + lastLoc.IsZero().ToString());
 			EchoToLCD("Status: Returning Last Location");
 
 			ResetTargets(); //resets any target info
@@ -423,14 +481,12 @@ namespace IngameScript
 				modeIndicator.SetValue<Color>("Color", new Color(1f, 0f, 0f));
 
 			StopPatrol(); //Stops the patrole RC Block
-
-			EchoToLCD(String.Format("Status: Attacking Target {0} [{1}]", grid.Name.ToString(), grid.Relationship.ToString()));
+			EchoToLCD($"Status: Attacking Target {grid.Name} [{grid.Relationship}]");
+			ToggleTurrets(); // Make sure turrets are online
 
 			//Gets the offset waypoint.
-			Vector3D newPosition = OffsetPos(Me.GetPosition(), grid.Position, attackDistance);
+			Vector3D newPosition = OffsetPos(Me.GetPosition(), grid.Position, trackingDistance);
 			SetWaypoint("Target", newPosition);
-
-			EnableTurrets(grid);
 		}
 
 		//Scans for targets
@@ -477,11 +533,11 @@ namespace IngameScript
 			return false;
 		}
 
-		//Resets target var and dissables turrets
+		//Resets target var and disables turrets
 		void ResetTargets()
 		{
-			targetGrid = new MyDetectedEntityInfo();
-			DisableTurrets(); //Disables all turrets
+			targetGrid = null;
+			ToggleTurrets(false); //Disables all turrets
 		}
 
 		//Makes sure the target is still valid 
@@ -526,33 +582,9 @@ namespace IngameScript
 				return -1;
 		}
 
-		//Enable all turrets on the grid 
-		void EnableTurrets(MyDetectedEntityInfo grid)
-		{
-			if (_activeTurrets != null && _activeTurrets.Count > 0)
-			{
-				for (int i = 0; i < _activeTurrets.Count; i += 1)
-				{
-					if (Vector3.DistanceSquared(grid.Position, Me.GetPosition()) < turretRange * turretRange)
-					{
-						_activeTurrets[i].GetActionWithName("OnOff_On").Apply(_activeTurrets[i]);
-					}
-					else
-						_activeTurrets[i].GetActionWithName("OnOff_Off").Apply(_activeTurrets[i]);
-				}
-			}
-		}
-
-		//Disable all turrets on the grid 
-		void DisableTurrets()
-		{
-			if (_activeTurrets != null && _activeTurrets.Count > 0)
-			{
-				for (int i = 0; i < _activeTurrets.Count; i += 1)
-				{
-					_activeTurrets[i].GetActionWithName("OnOff_Off").Apply(_activeTurrets[i]);
-				}
-			}
+		void ToggleTurrets(bool enabled = true)
+        {
+			if (_activeTurrets != null) foreach (var turret in _activeTurrets) turret.Enabled = enabled;
 		}
 	}
 }
