@@ -31,10 +31,10 @@ namespace IngameScript
 
 		//Configuration Section 
 		const double maxFollowRange = 5000; //Distance from home or last location before returning 
-		const double maxEnemyRange = 2500; //Max range enemy gets from the drone before returning 
+		const double maxEnemyRange = 5000; //Max range enemy gets from the drone before returning 
 		const float turretRange = 600; //Turret Range 
 		const float distanceBuffer = 5; //Used for home and last location. Distace from waypoint before it toggles done (meters)
-		const double trackingDistance = 200;  //Distance drone will keep from target
+		const double trackingDistance = 400;  //Distance drone will keep from target
 		const bool autoHome = true; //If true, will auto home if not near home when in Idle mode
 
 		//Do not edit below this point.
